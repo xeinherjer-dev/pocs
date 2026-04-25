@@ -1,0 +1,34 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "DPDK: Producer/Consumer App",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/dpdk-app",
+            "args": [
+                "--vdev=net_tap_vsc2", "--vdev=net_tap_vsc3",
+                "--vdev=net_tap_vsc4", "--vdev=net_tap_vsc5",
+                "--", "-d", "3", "-i", "500"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set Disassembly Flavor to Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "build"
+        }
+    ]
+}
