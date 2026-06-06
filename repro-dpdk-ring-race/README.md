@@ -4,17 +4,89 @@ This sample application demonstrates the data race (Race Condition) that occurs 
 
 ## Background & Mechanism
 
-DPDK's `rte_ring` supports several modes, including Single-Producer (SP) / Multi-Producer (MP) and Single-Consumer (SC) / Multi-Consumer (MC).
+In network programming, DPDK's `rte_ring` is a high-speed queue used to pass packet references (`mbuf`) between CPU cores. To achieve maximum performance, it provides different synchronization modes:
 
-- **Multi-Producer (MP)** mode: Multiple threads can safely enqueue concurrently because DPDK performs synchronization using atomic CAS (Compare-and-Swap) operations.
-- **Single-Producer (SP)** mode: Designed under the assumption that "only a single thread will perform enqueuing." It stores pointers into the ring and advances indices (`prod.head` / `prod.tail`) without any locking, achieving high performance.
+- **Multi-Producer (MP)**: Safe for multiple threads to write concurrently. It uses lock-free atomic CAS (Compare-and-Swap) operations to serialize pointer reservations.
+- **Single-Producer (SP)**: Fast, but **only one thread is allowed to write at a time**. It skips atomic checks to save CPU cycles.
 
-If multiple threads concurrently call the SP-mode enqueue API, the following race condition occurs:
+If multiple threads call the SP enqueue API concurrently, they overwrite each other's data and corrupt index pointers, leading to memory leaks and memory contamination.
 
-1. **Index Corruption**: Multiple threads read the same `prod.head` and try to write data to the same slots.
-2. **Data Loss & Duplication**: Pointers written by one thread are overwritten by another (leading to memory leaks). Meanwhile, the overwriting thread's pointers are duplicated or indexed incorrectly, leading to multiple reads of the same stale pointer.
-3. **Double Free Trigger**: The consumer dequeues the same mbuf address multiple times. Freeing these duplicate mbufs using `rte_pktmbuf_free()` leads to a **Double Free** vulnerability.
-4. **Mempool Contamination**: The double-free pollutes the mempool, adding the same object address to the free list multiple times. Subsequent allocations will assign the same address to different, concurrent allocation requests.
+Here is a step-by-step comparison of how these modes behave.
+
+### 1. Multi-Producer (MP) Mode - Correct & Safe Concurrent Writes
+
+In MP mode, threads use atomic operations to safely reserve distinct slots. Thread B detects Thread A's atomic reservation and backs off to the next slot, preventing any overlap.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Producer Thread A
+    participant B as Producer Thread B
+    participant R as Ring Buffer (Slots)
+
+    Note over R: Initial State: prod.head = 0
+    A->>R: Read prod.head (gets 0)
+    B->>R: Read prod.head (gets 0)
+    
+    A->>R: Atomic CAS (try to set prod.head to 1)
+    Note over A, R: Success! Thread A reserves Slot 0.
+    
+    B->>R: Atomic CAS (try to set prod.head to 1)
+    Note over B, R: Failed! Thread B detects Thread A won Slot 0.
+    
+    B->>R: Read prod.head again (gets 1)
+    B->>R: Atomic CAS (try to set prod.head to 2)
+    Note over B, R: Success! Thread B reserves Slot 1.
+    
+    A->>R: Write packet_A to Slot 0
+    B->>R: Write packet_B to Slot 1
+    
+    Note over R: Safe: Both packet_A and packet_B are stored correctly.
+```
+
+---
+
+### 2. Single-Producer (SP) Mode - Race Condition & Memory Corruption
+
+Without atomic synchronization, both threads assume Slot 0 is empty and write to the same space. This leads to packet loss and memory corruption.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Producer Thread A
+    participant B as Producer Thread B
+    participant R as Ring Buffer (Slots)
+    participant C as Consumer Thread
+
+    Note over R: Initial State: prod.head = 0, prod.tail = 0
+    A->>R: Read prod.head (gets 0)
+    B->>R: Read prod.head (gets 0)
+    
+    Note over A, B: Both threads assume Slot 0 is theirs without checking.
+    
+    A->>R: Write packet_A to Slot 0
+    B->>R: Write packet_B to Slot 0 [packet_A is OVERWRITTEN & LOST!]
+    
+    A->>R: Advance prod.head to 1 & prod.tail to 1
+    B->>R: Advance prod.head to 1 & prod.tail to 1
+    
+    Note over R: Slot 0 now contains packet_B. packet_A's pointer is lost (Memory Leak).
+    
+    C->>R: Read Slot 0 (Dequeues packet_B)
+    C->>R: Free packet_B (releases packet_B memory)
+    
+    Note over R: Due to index corruption/rollbacks, Consumer reads Slot 0 again...
+    
+    C->>R: Read Slot 0 again (Dequeues packet_B again!)
+    C->>R: Free packet_B again [CRITICAL: DOUBLE FREE / MEMPOOL CORRUPTION!]
+```
+
+---
+
+### Key Consequences for Developers
+
+- **Memory Leak (Packet Loss)**: When `packet_A` gets overwritten by `packet_B` in Slot 0, the program loses the reference pointer to `packet_A`. The memory block of `packet_A` remains allocated forever, causing physical memory exhaustion.
+- **Double Free & Mempool Pollution**: When `packet_B` is read and freed twice, the memory allocator registers the same memory block twice to the list of "free chunks". If different threads allocate memory later, they might get assigned the exact same memory block, leading to random data corruption or application crashes.
 
 ## Reproduction Steps
 
